@@ -1,0 +1,601 @@
+import os
+import json
+import shutil
+from pathlib import Path
+import logging
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple
+import random
+import tempfile
+
+import pytesseract
+from pdf2image import convert_from_path
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report
+import requests
+import cv2
+from PIL import Image
+from doctr.io import DocumentFile
+from doctr.models import ocr_predictor
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("pdf_processor.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Clear any existing handlers
+if logger.hasHandlers():
+    logger.handlers.clear()
+    
+
+class PDFProcessor:
+    def __init__(self, 
+                 input_dir: str, 
+                 output_dir: str, 
+                 document_types: List[str],
+                 ocr_engine: str = "tesseract",  # Options: "tesseract", "doctr"
+                 ollama_model: str = "llama3",
+                 ollama_url: str = "http://localhost:11434/api/generate"):
+        """
+        Initialize the PDF processor with input and output directories.
+        
+        Args:
+            input_dir: Directory containing PDF files
+            output_dir: Directory to store extracted JSON files and classified documents
+            document_types: List of predefined document types for classification
+            ocr_engine: OCR engine to use ('tesseract' or 'doctr')
+            ollama_model: Model name to use for synthetic data generation
+            ollama_url: URL for Ollama API
+        """
+        self.input_dir = Path(input_dir)
+        self.output_dir = Path(output_dir)
+        self.json_dir = self.output_dir / "json"
+        self.classified_dir = self.output_dir / "classified"
+        self.synthetic_dir = self.output_dir / "synthetic_data"
+        self.document_types = document_types
+        self.ocr_engine = ocr_engine
+        self.ollama_model = ollama_model
+        self.ollama_url = ollama_url
+        self.classifier = None
+        self.vectorizer = None
+
+        if not self.input_dir.exists():
+            raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
+            
+        # Initialize OCR engine
+        if self.ocr_engine == "doctr":
+            self.doctr_model = ocr_predictor(pretrained=True)
+        
+        # Create directory structure
+        for doc_type in document_types:
+            (self.classified_dir / doc_type).mkdir(parents=True, exist_ok=True)
+        
+        self.json_dir.mkdir(parents=True, exist_ok=True)
+        self.synthetic_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"Initialized PDFProcessor with input directory: {input_dir}")
+        logger.info(f"Output directory structure created at: {output_dir}")
+        logger.info(f"Using OCR engine: {ocr_engine}")
+    
+    def extract_text_with_tesseract(self, pdf_path: Path) -> Dict[str, Any]:
+        """
+        Extract text from PDF using Tesseract OCR.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            Dictionary containing extracted text and metadata
+        """
+        try:
+            # Convert PDF to images
+            with tempfile.TemporaryDirectory() as temp_dir:
+                images = convert_from_path(
+                    pdf_path, 
+                    output_folder=temp_dir,
+                    poppler_path=r'C:\Users\BHATTACHARYAMrSUBRAT\AVD Projects\robo-advisor\poppler-24.08.0\Library\bin'
+                )
+
+                # Process each page
+                pages = []
+                full_text = ""
+                
+                for page_num, image in enumerate(images):
+                    # Improve image quality for OCR
+                    logger.info(f"Processing page {page_num + 1} of {len(images)}")
+                    img_array = np.array(image)
+                    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+                    # Apply adaptive thresholding for better text extraction
+                    processed = cv2.adaptiveThreshold(
+                        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+                    )
+                    
+                    # Save processed image temporarily
+                    temp_img_path = os.path.join(temp_dir, f"processed_page_{page_num}.png")
+                    cv2.imwrite(temp_img_path, processed)
+                    logger.info(f"Saved processed image for page {page_num + 1}")
+                    
+                    # Extract text using Tesseract with proper resource management
+                    try:
+                        img = Image.open(temp_img_path)
+                        text = pytesseract.image_to_string(img)
+                        img.close()  # Properly close the image object
+                        logger.info(f"Extracted text from page {full_text}")
+                        # Delete the temp image file to free up file handle
+                        os.remove(temp_img_path)
+                    except Exception as img_error:
+                        logger.error(f"Error processing image on page {page_num + 1}: {str(img_error)}")
+                        text = ""  # Set empty text if processing fails
+                    
+                    full_text += text + "\n\n"
+                    logger.info(f"Completed text extraction for page {page_num + 1}")
+                    
+                    # Extract image information
+                    height, width = img_array.shape[:2]
+
+                    page_data = {
+                        "page_number": page_num + 1,
+                        "text": text,
+                        "image_dimensions": {
+                            "width": width,
+                            "height": height
+                        }
+                    }
+                    pages.append(page_data)
+            
+            # Create metadata dictionary
+            metadata = {
+                "filename": pdf_path.name,
+                "pageCount": len(pages),
+                "extracted_datetime": datetime.now().isoformat(),
+                "ocr_engine": "tesseract" #,
+#                "tesseract_version": pytesseract.get_tesseract_version(),
+            }
+            
+            # Create result dictionary
+            result = {
+                "metadata": metadata,
+                "pages": pages,
+                "full_text": full_text,
+            }
+            
+            logger.info(f"Successfully extracted text from {pdf_path.name} using Tesseract")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error extracting text from {pdf_path} with Tesseract: {str(e)}")
+            return {
+                "metadata": {"filename": pdf_path.name, "error": str(e)},
+                "pages": [],
+                "full_text": "",
+            }
+     
+    def extract_text_with_doctr(self, pdf_path: Path) -> Dict[str, Any]:
+        """
+        Extract text from PDF using DocTR OCR.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            Dictionary containing extracted text and metadata
+        """
+        try:
+            # Load document
+            doc = DocumentFile.from_pdf(pdf_path)
+            
+            # Run OCR prediction
+            result = self.doctr_model(doc)
+            
+            # Process each page
+            pages = []
+            full_text = ""
+            
+            for page_num, page in enumerate(result.pages):
+                # Extract text from page
+                page_text = ""
+                for block in page.blocks:
+                    for line in block.lines:
+                        line_text = " ".join(word.value for word in line.words)
+                        page_text += line_text + "\n"
+                
+                full_text += page_text + "\n\n"
+                
+                page_data = {
+                    "page_number": page_num + 1,
+                    "text": page_text,
+                    "blocks": len(page.blocks),
+                }
+                pages.append(page_data)
+            
+            # Create metadata dictionary
+            metadata = {
+                "filename": pdf_path.name,
+                "pageCount": len(pages),
+                "extracted_datetime": datetime.now().isoformat(),
+                "ocr_engine": "doctr",
+            }
+            
+            # Create result dictionary
+            result = {
+                "metadata": metadata,
+                "pages": pages,
+                "full_text": full_text,
+            }
+            
+            logger.info(f"Successfully extracted text from {pdf_path.name} using DocTR")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error extracting text from {pdf_path} with DocTR: {str(e)}")
+            return {
+                "metadata": {"filename": pdf_path.name, "error": str(e)},
+                "pages": [],
+                "full_text": "",
+            }
+    
+    def extract_text_from_pdf(self, pdf_path: Path) -> Dict[str, Any]:
+        """
+        Extract text from a PDF file using the selected OCR engine.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            Dictionary containing extracted text and metadata
+        """
+        if self.ocr_engine == "tesseract":
+            return self.extract_text_with_tesseract(pdf_path)
+        elif self.ocr_engine == "doctr":
+            return self.extract_text_with_doctr(pdf_path)
+        else:
+            logger.error(f"Unknown OCR engine: {self.ocr_engine}")
+            return {
+                "metadata": {"filename": pdf_path.name, "error": f"Unknown OCR engine: {self.ocr_engine}"},
+                "pages": [],
+                "full_text": "",
+            }
+    
+    def save_as_json(self, data: Dict[str, Any], pdf_path: Path) -> Path:
+        """
+        Save extracted data as JSON.
+        
+        Args:
+            data: Extracted data dictionary
+            pdf_path: Original PDF path
+            
+        Returns:
+            Path to the saved JSON file
+        """
+        try:
+            json_path = self.json_dir / f"{pdf_path.stem}.json"
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"Saved JSON to {json_path}")
+            return json_path
+        
+        except Exception as e:
+            logger.error(f"Error saving JSON for {pdf_path.name}: {str(e)}")
+            return None
+    
+    def train_classifier(self, labeled_data: Optional[str] = None):
+        """
+        Train a document classifier based on labeled data or existing classified documents.
+        
+        Args:
+            labeled_data: Path to CSV file with columns 'file_path' and 'doc_type',
+                          if None, will use existing classified documents
+        """
+        try:
+            # Prepare training data
+            texts = []
+            labels = []
+            
+            if labeled_data and os.path.exists(labeled_data):
+                # Use provided labeled data
+                df = pd.read_csv(labeled_data)
+                for _, row in df.iterrows():
+                    json_path = Path(row['file_path'])
+                    if json_path.exists():
+                        with open(json_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            texts.append(data.get('full_text', ''))
+                            labels.append(row['doc_type'])
+            else:
+                # Use existing classified documents
+                for doc_type in self.document_types:
+                    doc_type_dir = self.classified_dir / doc_type
+                    if not doc_type_dir.exists():
+                        continue
+                        
+                    for json_file in doc_type_dir.glob('*.json'):
+                        with open(json_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            texts.append(data.get('full_text', ''))
+                            labels.append(doc_type)
+            
+            if not texts:
+                logger.warning("No training data available for classifier")
+                return False
+                
+            # Feature extraction
+            self.vectorizer = TfidfVectorizer(max_features=5000, stop_words='english')
+            X = self.vectorizer.fit_transform(texts)
+            
+            # Train test split
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, labels, test_size=0.2, random_state=42
+            )
+            
+            # Train classifier
+            self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+            self.classifier.fit(X_train, y_train)
+            
+            # Evaluate classifier
+            y_pred = self.classifier.predict(X_test)
+            report = classification_report(y_test, y_pred)
+            logger.info(f"Classifier trained with results:\n{report}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error training classifier: {str(e)}")
+            return False
+    
+    def classify_document(self, data: Dict[str, Any]) -> str:
+        """
+        Classify a document based on its content.
+        
+        Args:
+            data: Extracted document data
+            
+        Returns:
+            Predicted document type
+        """
+        try:
+            if not self.classifier or not self.vectorizer:
+                logger.warning("Classifier not trained yet, using random classification")
+                return random.choice(self.document_types)
+            
+            # Transform text using vectorizer
+            text = data.get('full_text', '')
+            X = self.vectorizer.transform([text])
+            
+            # Predict document type
+            doc_type = self.classifier.predict(X)[0]
+            
+            logger.info(f"Classified document as {doc_type}")
+            return doc_type
+            
+        except Exception as e:
+            logger.error(f"Error classifying document: {str(e)}")
+            return random.choice(self.document_types)
+    
+    def organize_document(self, json_path: Path, doc_type: str) -> Path:
+        """
+        Organize document by copying to appropriate classified folder.
+        
+        Args:
+            json_path: Path to JSON file
+            doc_type: Classified document type
+            
+        Returns:
+            Path to the classified JSON file
+        """
+        try:
+            target_dir = self.classified_dir / doc_type
+            target_dir.mkdir(parents=True, exist_ok=True)
+            
+            target_path = target_dir / json_path.name
+            shutil.copy2(json_path, target_path)
+            
+            logger.info(f"Organized document {json_path.name} as {doc_type}")
+            return target_path
+            
+        except Exception as e:
+            logger.error(f"Error organizing document {json_path.name}: {str(e)}")
+            return None
+    
+    def generate_synthetic_data(self, num_samples: int = 5) -> List[Dict[str, Any]]:
+        """
+        Generate synthetic data using Ollama for each document type.
+        
+        Args:
+            num_samples: Number of synthetic samples per document type
+            
+        Returns:
+            List of generated synthetic data dictionaries
+        """
+        synthetic_data = []
+        
+        try:
+            for doc_type in self.document_types:
+                # Get examples of this document type (if available)
+                examples = list((self.classified_dir / doc_type).glob('*.json'))
+                example_texts = []
+                
+                if examples:
+                    # Sample up to 3 examples to provide context
+                    for example_path in random.sample(examples, min(3, len(examples))):
+                        with open(example_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            example_texts.append(data.get('full_text', '')[:500])  # Just the beginning for context
+                
+                # Create prompt for synthetic data generation
+                prompt = f"""Generate {num_samples} realistic examples of {doc_type} documents. 
+                Each example should have different but realistic content.
+                
+                {"Examples of real documents of this type (beginning excerpts):" if example_texts else ""}
+                {chr(10).join(example_texts[:3]) if example_texts else ""}
+                
+                Return the generated examples as a JSON array where each item has these fields:
+                - title: Document title
+                - content: Document content with multiple paragraphs
+                - metadata: Any relevant metadata for this document type
+                
+                Make sure the content is detailed, realistic, and representative of actual {doc_type} documents.
+                """
+                
+                # Call Ollama API
+                response = requests.post(
+                    self.ollama_url,
+                    json={
+                        "model": self.ollama_model,
+                        "prompt": prompt,
+                        "stream": False
+                    }
+                )
+                
+                if response.status_code == 200:
+                    response_text = response.json().get('response', '')
+                    
+                    # Extract JSON from response (handle potential text wrapping)
+                    try:
+                        # Try to find JSON array in the response
+                        start_idx = response_text.find('[')
+                        end_idx = response_text.rfind(']') + 1
+                        
+                        if start_idx >= 0 and end_idx > start_idx:
+                            json_text = response_text[start_idx:end_idx]
+                            generated_examples = json.loads(json_text)
+                            
+                            # Process and save each example
+                            for i, example in enumerate(generated_examples):
+                                # Create structured data
+                                synthetic_data_item = {
+                                    "metadata": {
+                                        "filename": f"synthetic_{doc_type}_{i+1}.json",
+                                        "title": example.get("title", f"Synthetic {doc_type} Document {i+1}"),
+                                        "author": "Synthetic Data Generator",
+                                        "created": datetime.now().isoformat(),
+                                        "doc_type": doc_type,
+                                        **example.get("metadata", {})
+                                    },
+                                    "full_text": example.get("content", ""),
+                                    "pages": [{
+                                        "page_number": 1,
+                                        "text": example.get("content", "")
+                                    }],
+                                    "synthetic": True
+                                }
+                                
+                                # Save to synthetic data directory
+                                synthetic_path = self.synthetic_dir / f"synthetic_{doc_type}_{i+1}.json"
+                                with open(synthetic_path, 'w', encoding='utf-8') as f:
+                                    json.dump(synthetic_data_item, f, indent=2)
+                                
+                                # Also save to classified directory for training
+                                classified_path = self.classified_dir / doc_type / f"synthetic_{doc_type}_{i+1}.json"
+                                with open(classified_path, 'w', encoding='utf-8') as f:
+                                    json.dump(synthetic_data_item, f, indent=2)
+                                
+                                synthetic_data.append(synthetic_data_item)
+                        else:
+                            logger.warning(f"Could not find JSON array in response for {doc_type}")
+                    except json.JSONDecodeError:
+                        logger.error(f"Failed to parse JSON from Ollama response for {doc_type}")
+                else:
+                    logger.error(f"Ollama API request failed with status {response.status_code}")
+            
+            logger.info(f"Generated {len(synthetic_data)} synthetic documents across {len(self.document_types)} types")
+            return synthetic_data
+            
+        except Exception as e:
+            logger.error(f"Error generating synthetic data: {str(e)}")
+            return []
+    
+    def process_all_pdfs(self) -> Tuple[int, int]:
+        """
+        Process all PDF files in the input directory.
+        
+        Returns:
+            Tuple of (number of processed files, number of successfully processed files)
+        """
+        processed = 0
+        successful = 0
+        
+        # Find all PDF files
+        pdf_files = list(self.input_dir.glob('**/*.pdf'))
+        logger.info(f"Found {len(pdf_files)} PDF files to process")
+        
+        # Train classifier if we have existing data
+        self.train_classifier()
+        
+        # Process each PDF
+        for pdf_path in pdf_files:
+            try:
+                processed += 1
+                
+                # Extract text
+                data = self.extract_text_from_pdf(pdf_path)
+                
+                # Save as JSON
+                json_path = self.save_as_json(data, pdf_path)
+                if not json_path:
+                    continue
+                
+                # Classify document
+                doc_type = self.classify_document(data)
+                
+                # Organize document
+                self.organize_document(json_path, doc_type)
+                
+                successful += 1
+                
+            except Exception as e:
+                logger.error(f"Error processing {pdf_path}: {str(e)}")
+        
+        logger.info(f"Processed {processed} PDFs, {successful} successful")
+        return processed, successful
+
+# Command-line interface
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Process PDF files, extract text with OCR, and classify documents')
+    parser.add_argument('--input', type=str, required=True, help='Input directory containing PDF files')
+    parser.add_argument('--output', type=str, required=True, help='Output directory for JSON files and classified documents')
+    parser.add_argument('--types', type=str, nargs='+', default=['invoice', 'contract', 'report', 'letter', 'form'],
+                        help='Document types for classification')
+    parser.add_argument('--ocr', type=str, choices=['tesseract', 'doctr'], default='tesseract',
+                        help='OCR engine to use')
+    parser.add_argument('--synthetic', type=int, default=5, help='Number of synthetic samples to generate per document type')
+    parser.add_argument('--ollama-model', type=str, default='llama3', help='Ollama model to use')
+    parser.add_argument('--ollama-url', type=str, default='http://localhost:11434/api/generate', help='Ollama API URL')
+    
+    args = parser.parse_args()
+    
+    # Initialize processor
+    processor = PDFProcessor(
+        input_dir=args.input,
+        output_dir=args.output,
+        document_types=args.types,
+        ocr_engine=args.ocr,
+        ollama_model=args.ollama_model,
+        ollama_url=args.ollama_url
+    )
+    
+    # Process PDFs
+    processed, successful = processor.process_all_pdfs()
+    print(f"Processed {processed} PDFs,python {successful} successfully processed")
+    
+    # Generate synthetic data
+    if args.synthetic > 0:
+        synthetic_data = processor.generate_synthetic_data(num_samples=args.synthetic)
+        print(f"Generated {len(synthetic_data)} synthetic documents")
+        
+        # Re-train classifier with synthetic data
+        processor.train_classifier()
+        print("Re-trained classifier with synthetic data")
